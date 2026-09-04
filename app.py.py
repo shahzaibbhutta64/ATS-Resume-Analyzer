@@ -1,9 +1,11 @@
 import gc
 import io
 import json
+import time
 import streamlit as st
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 import pdfplumber
 from docx import Document
 from PIL import Image
@@ -25,7 +27,9 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-MODEL_NAME = "gemini-3.6-flash"
+# Primary and Fallback Models
+PRIMARY_MODEL = "gemini-3.6-flash"
+FALLBACK_MODEL = "gemini-1.5-flash"
 
 client = None
 if api_key:
@@ -65,17 +69,28 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 def extract_text_from_image(file_bytes: bytes, client) -> str:
     try:
         image = Image.open(io.BytesIO(file_bytes))
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[
-                "Extract ALL text from this resume image exactly as it appears, "
-                "preserving section order. Return ONLY the extracted text.",
-                image,
-            ],
-        )
+        prompt_contents = [
+            "Extract ALL text from this resume image exactly as it appears, "
+            "preserving section order. Return ONLY the extracted text.",
+            image,
+        ]
+        
+        # Try primary model first, fallback if busy
+        response = None
+        for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt_contents,
+                )
+                if response:
+                    break
+            except APIError:
+                continue
+
         del image
         gc.collect()
-        return response.text.strip()
+        return response.text.strip() if response else ""
     except Exception as e:
         st.error(f"Error reading image with Gemini Vision: {e}")
         return ""
@@ -106,7 +121,7 @@ def get_resume_text(uploaded_file, client) -> str:
         st.error("Unsupported file type.")
         return ""
 
-# ---------- GEMINI ATS ANALYSIS ----------
+# ---------- GEMINI ATS ANALYSIS WITH RETRY & FALLBACK ----------
 
 ATS_PROMPT_TEMPLATE = """
 You are an expert ATS (Applicant Tracking System) analyzer and professional resume coach.
@@ -130,28 +145,51 @@ def build_jd_section(job_description: str) -> str:
 \"\"\""""
     return "No specific job description was provided — evaluate against general ATS best practices."
 
+def call_gemini_with_retry(client, prompt: str, config):
+    """Retries request on 503 busy errors, then attempts fallback model."""
+    models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
+    
+    for model in models_to_try:
+        retries = 3
+        delay = 2  # wait 2 seconds before retrying
+        
+        for attempt in range(retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                return response
+            except APIError as e:
+                if e.code == 503 and attempt < retries - 1:
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff (2s, 4s)
+                else:
+                    break  # Move to fallback model if retries fail
+    return None
+
 def analyze_resume(resume_text: str, job_description: str, client):
     prompt = ATS_PROMPT_TEMPLATE.format(
         resume_text=resume_text,
         jd_section=build_jd_section(job_description),
     )
     
-    # Enforce Native JSON Output from Gemini
     config = types.GenerateContentConfig(
-        temperature=0.2,
         response_mime_type="application/json",
     )
 
+    response = call_gemini_with_retry(client, prompt, config)
+
+    if not response:
+        st.error("Google's servers are currently under high traffic (503 High Demand). Please wait 10–20 seconds and click 'Analyze Resume' again.")
+        return None
+
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=config,
-        )
         data = json.loads(response.text)
         return data
     except Exception as e:
-        st.error(f"Gemini API request or JSON parsing failed: {e}")
+        st.error(f"Failed to parse AI response: {e}")
         return None
 
 # ---------- UI ----------
@@ -186,7 +224,7 @@ if analyze_btn:
             with st.expander("📋 Extracted Resume Text (verify this looks correct)"):
                 st.text(resume_text)
 
-            with st.spinner("Analyzing with Gemini..."):
+            with st.spinner("Analyzing with Gemini (retrying if high demand)..."):
                 result = analyze_resume(resume_text, job_description, client)
 
             if result:
@@ -236,7 +274,6 @@ if analyze_btn:
                     mime="application/json",
                 )
 
-                # Garbage collection after display
                 gc.collect()
 
 st.sidebar.markdown("---")
