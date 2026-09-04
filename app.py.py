@@ -1,12 +1,12 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import pdfplumber
 from docx import Document
 from PIL import Image
 import json
 import re
 import io
-import os
 
 # ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="ATS Resume Scorer", page_icon="📄", layout="wide")
@@ -25,10 +25,11 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-if api_key:
-    genai.configure(api_key=api_key)
-
 MODEL_NAME = "gemini-2.0-flash"
+
+client = None
+if api_key:
+    client = genai.Client(api_key=api_key)
 
 # ---------- TEXT EXTRACTION FUNCTIONS ----------
 
@@ -62,17 +63,18 @@ def extract_text_from_docx(file_bytes):
     return text.strip()
 
 
-def extract_text_from_image(file_bytes, model):
+def extract_text_from_image(file_bytes, client):
     """Use Gemini's vision capability to read text directly from an image resume."""
     try:
         image = Image.open(io.BytesIO(file_bytes))
-        response = model.generate_content(
-            [
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
                 "Extract ALL text from this resume image exactly as it appears, "
                 "preserving section order (name, contact, summary, experience, "
                 "education, skills, etc). Return ONLY the extracted text, no commentary.",
                 image,
-            ]
+            ],
         )
         return response.text.strip()
     except Exception as e:
@@ -80,7 +82,7 @@ def extract_text_from_image(file_bytes, model):
         return ""
 
 
-def get_resume_text(uploaded_file, model):
+def get_resume_text(uploaded_file, client):
     file_bytes = uploaded_file.read()
     file_type = uploaded_file.type
 
@@ -100,7 +102,7 @@ def get_resume_text(uploaded_file, model):
         return extract_text_from_docx(file_bytes)
 
     elif file_type in ["image/png", "image/jpeg", "image/jpg"]:
-        return extract_text_from_image(file_bytes, model)
+        return extract_text_from_image(file_bytes, client)
 
     else:
         st.error("Unsupported file type.")
@@ -164,12 +166,16 @@ def build_jd_section(job_description):
     return "No specific job description was provided — evaluate against general ATS best practices for this resume's apparent field."
 
 
-def analyze_resume(resume_text, job_description, model):
+def analyze_resume(resume_text, job_description, client):
     prompt = ATS_PROMPT_TEMPLATE.format(
         resume_text=resume_text,
         jd_section=build_jd_section(job_description),
     )
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3),
+    )
     raw = response.text.strip()
 
     # Strip markdown code fences if Gemini adds them despite instructions
@@ -202,14 +208,13 @@ with col2:
 analyze_btn = st.button("🔍 Analyze Resume", type="primary")
 
 if analyze_btn:
-    if not api_key:
+    if not api_key or client is None:
         st.error("Please enter your Gemini API key in the sidebar first.")
     elif not uploaded_file:
         st.error("Please upload a resume file.")
     else:
-        model = genai.GenerativeModel(MODEL_NAME)
         with st.spinner("Extracting text from your resume..."):
-            resume_text = get_resume_text(uploaded_file, model)
+            resume_text = get_resume_text(uploaded_file, client)
 
         if not resume_text:
             st.error("Couldn't extract any text from this file. Try a different format.")
@@ -218,7 +223,7 @@ if analyze_btn:
                 st.text(resume_text)
 
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(resume_text, job_description, model)
+                result = analyze_resume(resume_text, job_description, client)
 
             if result:
                 score = result.get("ats_score", 0)
