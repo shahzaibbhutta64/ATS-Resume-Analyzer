@@ -1,12 +1,12 @@
+import gc
+import io
+import json
 import streamlit as st
 from google import genai
 from google.genai import types
 import pdfplumber
 from docx import Document
 from PIL import Image
-import json
-import re
-import io
 
 # ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="ATS Resume Scorer", page_icon="📄", layout="wide")
@@ -25,15 +25,16 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-MODEL_NAME = "gemini-3.6-flash"  # alias: always resolves to Google's newest Flash model
+MODEL_NAME = "gemini-2.5-flash"
 
 client = None
 if api_key:
     client = genai.Client(api_key=api_key)
 
-# ---------- TEXT EXTRACTION FUNCTIONS ----------
+# ---------- CACHED TEXT EXTRACTION FUNCTIONS ----------
 
-def extract_text_from_pdf(file_bytes):
+@st.cache_data(show_spinner=False, max_entries=10, ttl=3600)
+def extract_text_from_pdf(file_bytes: bytes) -> str:
     text = ""
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -45,14 +46,13 @@ def extract_text_from_pdf(file_bytes):
         st.error(f"Error reading PDF: {e}")
     return text.strip()
 
-
-def extract_text_from_docx(file_bytes):
+@st.cache_data(show_spinner=False, max_entries=10, ttl=3600)
+def extract_text_from_docx(file_bytes: bytes) -> str:
     text = ""
     try:
         doc = Document(io.BytesIO(file_bytes))
         for para in doc.paragraphs:
             text += para.text + "\n"
-        # also grab text inside tables (many resumes use tables)
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
@@ -62,28 +62,26 @@ def extract_text_from_docx(file_bytes):
         st.error(f"Error reading DOCX: {e}")
     return text.strip()
 
-
-def extract_text_from_image(file_bytes, client):
-    """Use Gemini's vision capability to read text directly from an image resume."""
+def extract_text_from_image(file_bytes: bytes, client) -> str:
     try:
         image = Image.open(io.BytesIO(file_bytes))
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=[
                 "Extract ALL text from this resume image exactly as it appears, "
-                "preserving section order (name, contact, summary, experience, "
-                "education, skills, etc). Return ONLY the extracted text, no commentary.",
+                "preserving section order. Return ONLY the extracted text.",
                 image,
             ],
         )
+        del image
+        gc.collect()
         return response.text.strip()
     except Exception as e:
         st.error(f"Error reading image with Gemini Vision: {e}")
         return ""
 
-
-def get_resume_text(uploaded_file, client):
-    file_bytes = uploaded_file.read()
+def get_resume_text(uploaded_file, client) -> str:
+    file_bytes = uploaded_file.getvalue()
     file_type = uploaded_file.type
 
     if file_type == "application/pdf":
@@ -108,12 +106,10 @@ def get_resume_text(uploaded_file, client):
         st.error("Unsupported file type.")
         return ""
 
-
 # ---------- GEMINI ATS ANALYSIS ----------
 
 ATS_PROMPT_TEMPLATE = """
 You are an expert ATS (Applicant Tracking System) analyzer and professional resume coach.
-
 Analyze the following resume text and evaluate it as an ATS system would.
 
 RESUME TEXT:
@@ -123,81 +119,40 @@ RESUME TEXT:
 
 {jd_section}
 
-Return your analysis STRICTLY as a valid JSON object with this exact structure (no markdown fences, no extra text):
-
-{{
-  "ats_score": <integer 0-100>,
-  "score_breakdown": {{
-    "formatting": <integer 0-25>,
-    "keyword_optimization": <integer 0-25>,
-    "content_quality": <integer 0-25>,
-    "structure_sections": <integer 0-25>
-  }},
-  "strengths": ["<short point>", "..."],
-  "critical_issues": ["<short point>", "..."],
-  "section_feedback": {{
-    "contact_info": "<feedback + ATS-friendly fix>",
-    "summary_objective": "<feedback + ATS-friendly fix>",
-    "work_experience": "<feedback + ATS-friendly fix, mention bullet phrasing/action verbs/quantification>",
-    "skills": "<feedback + ATS-friendly fix, keyword suggestions>",
-    "education": "<feedback + ATS-friendly fix>",
-    "formatting_layout": "<feedback about tables/columns/graphics/fonts that break ATS parsing>"
-  }},
-  "missing_keywords": ["<keyword>", "..."],
-  "rewritten_bullet_examples": [
-    {{"original": "<a weak bullet found in resume, or 'N/A' if none found>", "improved": "<stronger ATS-friendly, quantified rewrite>"}}
-  ]
-}}
-
-Rules for the improvements you suggest:
-- Every suggestion must be genuinely ATS-friendly: standard section headings, no tables/text boxes/columns/graphics/icons for critical info, standard fonts, no headers/footers for key content, simple bullet points, spelled-out + abbreviated forms of key terms where relevant (e.g. "Search Engine Optimization (SEO)").
-- Favor strong action verbs and quantifiable results (numbers, %, $, time saved) in bullet rewrites.
-- Keep feedback specific to THIS resume's actual content, not generic advice.
-- If a section is missing entirely, say so and explain what to add.
+Provide your response according to the JSON format instructions.
 """
 
-
-def build_jd_section(job_description):
+def build_jd_section(job_description: str) -> str:
     if job_description and job_description.strip():
-        return f"""ALSO compare it against this target job description and weight missing_keywords and keyword_optimization accordingly:
+        return f"""ALSO compare it against this target job description:
 \"\"\"
 {job_description}
 \"\"\""""
-    return "No specific job description was provided — evaluate against general ATS best practices for this resume's apparent field."
+    return "No specific job description was provided — evaluate against general ATS best practices."
 
-
-def analyze_resume(resume_text, job_description, client):
+def analyze_resume(resume_text: str, job_description: str, client):
     prompt = ATS_PROMPT_TEMPLATE.format(
         resume_text=resume_text,
         jd_section=build_jd_section(job_description),
     )
+    
+    # Enforce Native JSON Output from Gemini
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
+    )
+
     try:
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.3),
+            config=config,
         )
-    except Exception as e:
-        st.error(f"Gemini API request failed: {e}")
-        st.info(
-            "Common causes: invalid/expired API key, no free quota left today, "
-            "or a temporary Gemini API outage. Check your key at "
-            "https://aistudio.google.com/app/apikey"
-        )
-        return None
-    raw = response.text.strip()
-
-    # Strip markdown code fences if Gemini adds them despite instructions
-    raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-
-    try:
-        data = json.loads(raw)
+        data = json.loads(response.text)
         return data
-    except json.JSONDecodeError:
-        st.error("Couldn't parse the AI response as JSON. Raw response shown below for debugging.")
-        st.code(raw)
+    except Exception as e:
+        st.error(f"Gemini API request or JSON parsing failed: {e}")
         return None
-
 
 # ---------- UI ----------
 
@@ -280,6 +235,9 @@ if analyze_btn:
                     file_name="ats_report.json",
                     mime="application/json",
                 )
+
+                # Garbage collection after display
+                gc.collect()
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Your API key is only used for this session and is never stored.")
