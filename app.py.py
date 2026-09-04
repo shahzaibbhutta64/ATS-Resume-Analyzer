@@ -25,7 +25,7 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 client = None
 if api_key:
