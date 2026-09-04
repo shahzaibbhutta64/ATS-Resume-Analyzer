@@ -25,7 +25,7 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-flash-latest"  # alias: always resolves to Google's newest Flash model
 
 client = None
 if api_key:
@@ -171,11 +171,20 @@ def analyze_resume(resume_text, job_description, client):
         resume_text=resume_text,
         jd_section=build_jd_section(job_description),
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.3),
-    )
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.3),
+        )
+    except Exception as e:
+        st.error(f"Gemini API request failed: {e}")
+        st.info(
+            "Common causes: invalid/expired API key, no free quota left today, "
+            "or a temporary Gemini API outage. Check your key at "
+            "https://aistudio.google.com/app/apikey"
+        )
+        return None
     raw = response.text.strip()
 
     # Strip markdown code fences if Gemini adds them despite instructions
