@@ -25,7 +25,7 @@ api_key = st.sidebar.text_input(
 )
 st.sidebar.markdown("[Get a free API key](https://aistudio.google.com/app/apikey)")
 
-MODEL_NAME = "gemini-2.5-flash"  # alias: always resolves to Google's newest Flash model
+MODEL_NAME = "gemini-3.6-flash"  # alias: always resolves to Google's newest Flash model
 
 client = None
 if api_key:
